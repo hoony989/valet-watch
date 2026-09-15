@@ -1,0 +1,126 @@
+name: 아마노 발렛 슬롯 감시
+
+on:
+  schedule:
+    # 10분 간격. GitHub는 부하에 따라 예약 실행을 수 분~수십 분 지연시킬 수 있음.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:        # 수동 실행 버튼 (설치 직후 테스트용)
+
+permissions:
+  issues: write             # 슬롯이 열리면 이슈 생성
+  actions: write            # 마감일 지나면 스스로 비활성화
+
+concurrency:
+  group: valet-watch
+  cancel-in-progress: false
+
+env:
+  TARGET_DATE: '2026-09-20'   # 출발일 (항공편 출발 기준)
+  DEADLINE: '2026-09-20'      # 이 날(KST)이 지나면 감시 자동 종료
+  API: 'https://api.amanopark.co.kr/api/web/setting/booking/check'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 마감일 확인 (지났으면 스스로 종료)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TODAY="$(TZ=Asia/Seoul date +%F)"
+          echo "오늘(KST): $TODAY / 마감: $DEADLINE"
+          if [[ "$TODAY" > "$DEADLINE" ]]; then
+            echo "마감일이 지나 감시를 종료합니다."
+            gh workflow disable "${{ github.workflow }}" --repo "${{ github.repository }}" || true
+            exit 0
+          fi
+          echo "continue=yes" >> "$GITHUB_ENV"
+
+      - name: 예약 가능 여부 조회
+        if: env.continue == 'yes'
+        id: probe
+        run: |
+          set -uo pipefail
+          OPEN=""
+          FAIL=""
+
+          for TYPE in BASIC PREMIUM; do
+            URL="${API}?date=${TARGET_DATE}&type=${TYPE}"
+
+            # -sS: 조용하되 에러는 보이게 / --max-time: 멈춤 방지
+            BODY="$(curl -sS --max-time 25 \
+              -H 'Accept: application/json' \
+              -H 'Referer: https://valet.amanopark.co.kr/' \
+              -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36' \
+              -w $'\n%{http_code}' "$URL")" || { FAIL="${FAIL}${TYPE}: curl 실패"$'\n'; continue; }
+
+            CODE="$(tail -n1 <<<"$BODY")"
+            JSON="$(sed '$d' <<<"$BODY")"
+
+            if [[ "$CODE" != "200" ]]; then
+              FAIL="${FAIL}${TYPE}: HTTP ${CODE} / ${JSON:0:200}"$'\n'
+              continue
+            fi
+
+            DATA="$(jq -r '.data' <<<"$JSON" 2>/dev/null || echo PARSE_ERR)"
+
+            # true/false 외의 값은 '마감'이 아니라 '고장'으로 취급한다.
+            case "$DATA" in
+              true)  OPEN="${OPEN}${TYPE} "; echo "$TYPE: 예약 가능!" ;;
+              false) echo "$TYPE: 마감" ;;
+              *)     FAIL="${FAIL}${TYPE}: 예상치 못한 응답 / ${JSON:0:200}"$'\n' ;;
+            esac
+          done
+
+          {
+            echo "open=${OPEN}"
+            echo "fail<<VALET_EOF"
+            echo "${FAIL}"
+            echo "VALET_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 슬롯 열림 → 이슈 생성
+        if: steps.probe.outputs.open != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPEN_TYPES: ${{ steps.probe.outputs.open }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }}
+        run: |
+          NOW="$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M')"
+          BODY=$(cat <<VALET_EOF
+          @${OWNER} ${TARGET_DATE} 주차대행 슬롯이 열렸습니다.
+
+          열린 유형: **${OPEN_TYPES}**
+
+          바로 예약: https://valet.amanopark.co.kr/booking
+
+          확인 시각(KST): ${NOW}
+
+          취소분은 금방 다시 나갑니다. 확인하는 대로 예약하세요.
+          VALET_EOF
+          )
+          # 위 heredoc은 YAML 들여쓰기가 남으므로 제거 (4칸 이상이면 코드블록으로 렌더됨)
+          BODY="$(sed 's/^ *//' <<<"$BODY")"
+
+          gh issue create --repo "$REPO" \
+            --title "🚗 ${TARGET_DATE} 발렛 예약 가능 (${OPEN_TYPES})" \
+            --body "$BODY"
+
+      - name: 조회 실패 → 알림 (마감과 혼동 금지)
+        if: steps.probe.outputs.fail != ''
+        env:
+          FAIL_DETAIL: ${{ steps.probe.outputs.fail }}
+        run: |
+          echo "::error::발렛 조회 실패 — 마감이 아니라 감시가 동작하지 않는 상태입니다."
+          printf '%s\n' "$FAIL_DETAIL"
+          exit 1
+
+      - name: 슬롯 열림 → 워크플로 실패 처리 (메일 알림 트리거)
+        if: steps.probe.outputs.open != ''
+        env:
+          OPEN_TYPES: ${{ steps.probe.outputs.open }}
+        run: |
+          echo "::error::${TARGET_DATE} 슬롯 열림 (${OPEN_TYPES}) — 지금 예약하세요"
+          exit 1
