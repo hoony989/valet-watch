@@ -4,7 +4,12 @@ on:
   schedule:
     # 10분 간격. GitHub는 부하에 따라 예약 실행을 수 분~수십 분 지연시킬 수 있음.
     - cron: '*/10 * * * *'
-  workflow_dispatch:        # 수동 실행 버튼 (설치 직후 테스트용)
+  workflow_dispatch:
+    inputs:
+      test_date:
+        description: '테스트용 날짜 (YYYY-MM-DD). 비워두면 실제 감시일을 씁니다.'
+        required: false
+        default: ''
 
 permissions:
   issues: write             # 슬롯이 열리면 이슈 생성
@@ -15,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TARGET_DATE: '2026-09-20'   # 출발일 (항공편 출발 기준)
+  DEFAULT_DATE: '2026-09-20'  # 실제 출발일 (항공편 출발 기준)
   DEADLINE: '2026-09-20'      # 이 날(KST)이 지나면 감시 자동 종료
   API: 'https://api.amanopark.co.kr/api/web/setting/booking/check'
 
@@ -24,12 +29,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: 마감일 확인 (지났으면 스스로 종료)
+      - name: 감시 날짜 결정 + 마감일 확인
         env:
           GH_TOKEN: ${{ github.token }}
+          TEST_DATE: ${{ inputs.test_date }}
         run: |
+          # 수동 실행에서 날짜를 넣으면 그 날짜로, 아니면 실제 감시일로.
+          D="${TEST_DATE:-}"
+          if [[ -n "$D" ]]; then
+            if [[ ! "$D" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+              echo "::error::날짜 형식이 잘못되었습니다: $D (YYYY-MM-DD)"
+              exit 1
+            fi
+            echo "::notice::테스트 모드 — $D 로 조회합니다."
+          else
+            D="$DEFAULT_DATE"
+          fi
+          echo "TARGET_DATE=$D" >> "$GITHUB_ENV"
+
           TODAY="$(TZ=Asia/Seoul date +%F)"
-          echo "오늘(KST): $TODAY / 마감: $DEADLINE"
+          echo "오늘(KST): $TODAY / 감시일: $D / 마감: $DEADLINE"
           if [[ "$TODAY" > "$DEADLINE" ]]; then
             echo "마감일이 지나 감시를 종료합니다."
             gh workflow disable "${{ github.workflow }}" --repo "${{ github.repository }}" || true
@@ -87,8 +106,12 @@ jobs:
           OPEN_TYPES: ${{ steps.probe.outputs.open }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.repository }}
+          TEST_DATE: ${{ inputs.test_date }}
         run: |
           NOW="$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M')"
+          PREFIX=""
+          [[ -n "${TEST_DATE:-}" ]] && PREFIX="[테스트] "
+
           BODY=$(cat <<VALET_EOF
           @${OWNER} ${TARGET_DATE} 주차대행 슬롯이 열렸습니다.
 
@@ -105,7 +128,7 @@ jobs:
           BODY="$(sed 's/^ *//' <<<"$BODY")"
 
           gh issue create --repo "$REPO" \
-            --title "🚗 ${TARGET_DATE} 발렛 예약 가능 (${OPEN_TYPES})" \
+            --title "${PREFIX}🚗 ${TARGET_DATE} 발렛 예약 가능 (${OPEN_TYPES})" \
             --body "$BODY"
 
       - name: 조회 실패 → 알림 (마감과 혼동 금지)
